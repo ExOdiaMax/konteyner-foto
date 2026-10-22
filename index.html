@@ -1,0 +1,230 @@
+<!doctype html>
+<html lang="tr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#1a56db">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon.svg">
+<title>Konteyner Foto</title>
+<style>
+  :root { --bg:#f4f6fa; --card:#fff; --text:#111827; --muted:#6b7280; --brand:#1a56db; --ok:#15803d; --err:#b91c1c; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#0f1115; --card:#1a1d24; --text:#f3f4f6; --muted:#9ca3af; --brand:#60a5fa; --ok:#4ade80; --err:#f87171; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:16px/1.4 system-ui, sans-serif; }
+  main { max-width:480px; margin:0 auto; padding:16px; display:grid; gap:12px; }
+  .card { background:var(--card); border-radius:14px; padding:16px; display:grid; gap:12px; }
+  h1 { font-size:20px; margin:0; }
+  label { font-size:14px; color:var(--muted); }
+  input[type=text], input[type=password] { width:100%; padding:14px; font-size:20px; border:1px solid var(--muted); border-radius:10px; background:var(--bg); color:var(--text); text-transform:uppercase; letter-spacing:1px; }
+  input[type=password] { text-transform:none; }
+  button, .btn { display:block; width:100%; padding:16px; font-size:18px; font-weight:600; border:0; border-radius:12px; background:var(--brand); color:#fff; text-align:center; }
+  button.secondary, .btn.secondary { background:transparent; color:var(--brand); border:2px solid var(--brand); }
+  button:disabled { opacity:.5; }
+  input[type=file] { display:none; }
+  progress { width:100%; height:14px; }
+  #status { font-weight:600; }
+  .ok { color:var(--ok); } .err { color:var(--err); }
+  .muted { color:var(--muted); font-size:14px; }
+  .hidden { display:none; }
+</style>
+</head>
+<body>
+<main>
+  <section id="login" class="card hidden">
+    <h1>Giriş</h1>
+    <label for="pin">Size verilen PIN</label>
+    <input id="pin" type="password" inputmode="numeric" autocomplete="off">
+    <button id="loginBtn">Giriş yap</button>
+    <div id="loginMsg" class="err"></div>
+  </section>
+
+  <section id="app" class="card hidden">
+    <h1>Merhaba <span id="who"></span></h1>
+    <label for="container">Konteyner numarası</label>
+    <input id="container" type="text" autocapitalize="characters" autocomplete="off" placeholder="MSDU6983219" maxlength="32">
+    <label class="btn" for="camera">📷 Fotoğraf çek</label>
+    <input id="camera" type="file" accept="image/*" capture="environment">
+    <label class="btn secondary" for="gallery">🖼️ Galeriden seç</label>
+    <input id="gallery" type="file" accept="image/*" multiple>
+    <progress id="bar" value="0" max="1" class="hidden"></progress>
+    <div id="status"></div>
+    <button id="retryBtn" class="secondary hidden">Başarısızları tekrar dene</button>
+    <div class="muted">Yükleme bitene kadar bu sayfayı açık tutun.</div>
+    <button id="logoutBtn" class="secondary">Çıkış</button>
+  </section>
+</main>
+
+<script>
+// ---- Ayarlar ----
+const APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbwQgMh6jhLZgEqGC2DbDXFZ5vrACW_9NAWG6fGQ3VJcXF7SNzLg2JAfJfPsyufD-sGtfQ/exec';
+const SCALE = 0.4;          // her kenar: %40 (çözünürlük %60 düşer)
+const JPEG_QUALITY = 0.75;
+const PARALLEL = 3;
+const RETRIES = 3;
+const CONTAINER_PATTERN = /^[A-Z0-9][A-Z0-9_-]{2,31}$/;
+
+const $ = (id) => document.getElementById(id);
+let pin = null;
+let failed = [];   // { file, container }
+let wakeLock = null;
+
+// ---- Giriş ----
+function store(key, value) { try { value === null ? localStorage.removeItem(key) : localStorage.setItem(key, value); } catch {} }
+function load(key) { try { return localStorage.getItem(key); } catch { return null; } }
+
+async function callScript(payload) {
+  const response = await fetch(APPS_SCRIPT_URL, {
+    method: 'POST',
+    headers: { 'content-type': 'text/plain;charset=utf-8' },
+    body: JSON.stringify(payload)
+  });
+  return response.json();
+}
+
+async function enter(candidate) {
+  const result = await callScript({ action: 'check', pin: candidate });
+  if (!result.ok) throw new Error(result.error || 'Giriş başarısız');
+  pin = candidate;
+  store('pin', candidate);
+  $('who').textContent = result.worker;
+  $('login').classList.add('hidden');
+  $('app').classList.remove('hidden');
+}
+
+$('loginBtn').addEventListener('click', async () => {
+  $('loginMsg').textContent = '';
+  try { await enter($('pin').value.trim()); }
+  catch (error) { $('loginMsg').textContent = error.message; }
+});
+
+$('logoutBtn').addEventListener('click', () => {
+  store('pin', null);
+  pin = null;
+  $('app').classList.add('hidden');
+  $('login').classList.remove('hidden');
+});
+
+// ---- Küçültme ----
+async function compress(file) {
+  const bitmap = await createImageBitmap(file, { imageOrientation: 'from-image' });
+  const width = Math.max(1, Math.round(bitmap.width * SCALE));
+  const height = Math.max(1, Math.round(bitmap.height * SCALE));
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  canvas.getContext('2d').drawImage(bitmap, 0, 0, width, height);
+  bitmap.close();
+  const blob = await new Promise((resolve) => canvas.toBlob(resolve, 'image/jpeg', JPEG_QUALITY));
+  if (!blob) throw new Error('Fotoğraf küçültülemedi');
+  return blob;
+}
+
+function toBase64(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result).split(',')[1]);
+    reader.onerror = () => reject(reader.error);
+    reader.readAsDataURL(blob);
+  });
+}
+
+// Aynı fotoğraf tekrar seçilirse aynı ad çıkar; Drive tarafı kopya oluşturmaz.
+function stableName(container, file) {
+  const base = file.name.replace(/\.[^.]+$/, '').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 40) || 'foto';
+  return `${container}_${file.lastModified}_${base}.jpg`;
+}
+
+// ---- Yükleme ----
+async function uploadOne(file, container) {
+  const blob = await compress(file);
+  const data = await toBase64(blob);
+  let lastError;
+  for (let attempt = 1; attempt <= RETRIES; attempt += 1) {
+    try {
+      const result = await callScript({ pin, container, filename: stableName(container, file), data });
+      if (result.ok) return;
+      lastError = new Error(result.error || 'Yükleme reddedildi');
+      if (result.error === 'PIN hatalı') break;
+    } catch (error) {
+      lastError = error;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1000 * attempt));
+  }
+  throw lastError;
+}
+
+async function uploadAll(items) {
+  const total = items.length;
+  let done = 0;
+  let nextIndex = 0;
+  failed = [];
+  $('retryBtn').classList.add('hidden');
+  $('bar').classList.remove('hidden');
+  $('bar').max = total;
+  $('bar').value = 0;
+  $('status').className = '';
+
+  try { wakeLock = await navigator.wakeLock?.request('screen'); } catch {}
+  window.onbeforeunload = () => 'Yükleme sürüyor';
+
+  const worker = async () => {
+    while (nextIndex < total) {
+      const item = items[nextIndex++];
+      try { await uploadOne(item.file, item.container); }
+      catch { failed.push(item); }
+      done += 1;
+      $('bar').value = done;
+      $('status').textContent = `${done}/${total} işlendi`;
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(PARALLEL, total) }, worker));
+
+  window.onbeforeunload = null;
+  try { await wakeLock?.release(); } catch {}
+
+  const okCount = total - failed.length;
+  const container = items[0].container;
+  if (failed.length === 0) {
+    $('status').className = 'ok';
+    $('status').textContent = `✅ ${container}: ${okCount} fotoğraf yüklendi`;
+  } else {
+    $('status').className = 'err';
+    $('status').textContent = `⚠️ ${total} fotoğraftan ${okCount} tanesi yüklendi, ${failed.length} başarısız`;
+    $('retryBtn').classList.remove('hidden');
+  }
+}
+
+function startUpload(files) {
+  const container = $('container').value.trim().toUpperCase().replace(/\s+/g, '');
+  if (!CONTAINER_PATTERN.test(container)) {
+    $('status').className = 'err';
+    $('status').textContent = 'Önce konteyner numarasını yazın (ör. MSDU6983219).';
+    return;
+  }
+  if (files.length === 0) return;
+  uploadAll(Array.from(files).map((file) => ({ file, container })));
+}
+
+for (const id of ['camera', 'gallery']) {
+  $(id).addEventListener('change', (event) => {
+    startUpload(event.target.files);
+    event.target.value = '';
+  });
+}
+$('retryBtn').addEventListener('click', () => { if (failed.length) uploadAll(failed.slice()); });
+
+// ---- Başlangıç ----
+(async () => {
+  if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
+  const saved = load('pin');
+  if (saved) {
+    try { await enter(saved); return; } catch {}
+  }
+  $('login').classList.remove('hidden');
+})();
+</script>
+</body>
+</html>

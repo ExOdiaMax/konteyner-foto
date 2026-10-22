@@ -22,9 +22,13 @@
   input[type=password] { text-transform:none; }
   button, .btn { display:block; width:100%; padding:16px; font-size:18px; font-weight:600; border:0; border-radius:12px; background:var(--brand); color:#fff; text-align:center; }
   button.secondary, .btn.secondary { background:transparent; color:var(--brand); border:2px solid var(--brand); }
+  .row { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+  .row .btn { padding:14px 8px; font-size:16px; }
   button:disabled { opacity:.5; }
+  .btn.disabled { opacity:.5; pointer-events:none; }
   input[type=file] { display:none; }
   progress { width:100%; height:14px; }
+  #selected { font-weight:600; }
   #status { font-weight:600; }
   .ok { color:var(--ok); } .err { color:var(--err); }
   .muted { color:var(--muted); font-size:14px; }
@@ -45,10 +49,20 @@
     <h1>Merhaba <span id="who"></span></h1>
     <label for="container">Konteyner numarası</label>
     <input id="container" type="text" autocapitalize="characters" autocomplete="off" placeholder="MSDU6983219" maxlength="32">
-    <label class="btn" for="camera">📷 Fotoğraf çek</label>
-    <input id="camera" type="file" accept="image/*" capture="environment">
-    <label class="btn secondary" for="gallery">🖼️ Galeriden seç</label>
+
+    <div class="row">
+      <label class="btn secondary" for="gallery">🖼️ Galeri</label>
+      <label class="btn secondary" for="files">📁 Dosyalar</label>
+    </div>
+    <label class="btn secondary" for="camera">📷 Fotoğraf çek</label>
     <input id="gallery" type="file" accept="image/*" multiple>
+    <input id="files" type="file" accept="*/*" multiple>
+    <input id="camera" type="file" accept="image/*" capture="environment">
+
+    <div id="selected"></div>
+    <button id="sendBtn" class="hidden">Gönder</button>
+    <button id="clearBtn" class="secondary hidden">Seçimi temizle</button>
+
     <progress id="bar" value="0" max="1" class="hidden"></progress>
     <div id="status"></div>
     <button id="retryBtn" class="secondary hidden">Başarısızları tekrar dene</button>
@@ -62,13 +76,17 @@
 const APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbwQgMh6jhLZgEqGC2DbDXFZ5vrACW_9NAWG6fGQ3VJcXF7SNzLg2JAfJfPsyufD-sGtfQ/exec';
 const SCALE = 0.4;          // her kenar: %40 (çözünürlük %60 düşer)
 const JPEG_QUALITY = 0.75;
-const PARALLEL = 3;
+const PARALLEL = 6;         // aynı anda yüklenen fotoğraf
+const PREPARE_PARALLEL = 2; // aynı anda küçültülen fotoğraf (telefon belleği için sınırlı)
 const RETRIES = 3;
 const CONTAINER_PATTERN = /^[A-Z0-9][A-Z0-9_-]{2,31}$/;
+const IMAGE_NAME_PATTERN = /\.(jpe?g|png|webp|heic|heif)$/i;
 
 const $ = (id) => document.getElementById(id);
 let pin = null;
-let failed = [];   // { file, container }
+let queue = [];    // seçilmiş, henüz gönderilmemiş: { file, prepared }
+let failed = [];   // gönderilemeyenler: { file, container, prepared }
+let busy = false;
 let wakeLock = null;
 
 // ---- Giriş ----
@@ -107,7 +125,19 @@ $('logoutBtn').addEventListener('click', () => {
   $('login').classList.remove('hidden');
 });
 
-// ---- Küçültme ----
+// ---- Küçültme (seçer seçmez arka planda başlar) ----
+function createLimiter(max) {
+  let active = 0;
+  const waiting = [];
+  return async (task) => {
+    if (active >= max) await new Promise((resolve) => waiting.push(resolve));
+    active += 1;
+    try { return await task(); }
+    finally { active -= 1; waiting.shift()?.(); }
+  };
+}
+const prepareLimit = createLimiter(PREPARE_PARALLEL);
+
 async function compress(file) {
   const bitmap = await createImageBitmap(file, { imageOrientation: 'from-image' });
   const width = Math.max(1, Math.round(bitmap.width * SCALE));
@@ -131,20 +161,79 @@ function toBase64(blob) {
   });
 }
 
+function prepare(item) {
+  if (!item.prepared) {
+    item.prepared = prepareLimit(async () => toBase64(await compress(item.file))).catch((error) => {
+      item.prepared = null;   // tekrar denemede yeniden hazırlansın
+      throw error;
+    });
+  }
+  return item.prepared;
+}
+
 // Aynı fotoğraf tekrar seçilirse aynı ad çıkar; Drive tarafı kopya oluşturmaz.
 function stableName(container, file) {
   const base = file.name.replace(/\.[^.]+$/, '').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 40) || 'foto';
   return `${container}_${file.lastModified}_${base}.jpg`;
 }
 
+// ---- Seçim ----
+function isImage(file) {
+  return file.type.startsWith('image/') || IMAGE_NAME_PATTERN.test(file.name);
+}
+
+function fileKey(file) { return `${file.name}|${file.size}|${file.lastModified}`; }
+
+function refreshSelection() {
+  const hasQueue = queue.length > 0;
+  $('selected').textContent = hasQueue ? `${queue.length} fotoğraf seçildi` : '';
+  $('sendBtn').textContent = `Gönder (${queue.length})`;
+  $('sendBtn').classList.toggle('hidden', !hasQueue);
+  $('clearBtn').classList.toggle('hidden', !hasQueue);
+  $('sendBtn').disabled = busy;
+  for (const id of ['gallery', 'files', 'camera']) {
+    document.querySelector(`label[for=${id}]`).classList.toggle('disabled', busy);
+  }
+}
+
+function addFiles(fileList) {
+  const known = new Set(queue.map((item) => fileKey(item.file)));
+  let skipped = 0;
+  for (const file of fileList) {
+    if (!isImage(file)) { skipped += 1; continue; }
+    if (known.has(fileKey(file))) continue;
+    known.add(fileKey(file));
+    const item = { file, prepared: null };
+    prepare(item).catch(() => {});   // hata gönderirken bildirilir
+    queue.push(item);
+  }
+  if (skipped) {
+    $('status').className = 'err';
+    $('status').textContent = `${skipped} dosya fotoğraf olmadığı için atlandı.`;
+  }
+  refreshSelection();
+}
+
+for (const id of ['gallery', 'files', 'camera']) {
+  $(id).addEventListener('change', (event) => {
+    addFiles(Array.from(event.target.files));
+    event.target.value = '';
+  });
+}
+
+$('clearBtn').addEventListener('click', () => {
+  queue = [];
+  $('status').textContent = '';
+  refreshSelection();
+});
+
 // ---- Yükleme ----
-async function uploadOne(file, container) {
-  const blob = await compress(file);
-  const data = await toBase64(blob);
+async function uploadOne(item, container) {
+  const data = await prepare(item);
   let lastError;
   for (let attempt = 1; attempt <= RETRIES; attempt += 1) {
     try {
-      const result = await callScript({ pin, container, filename: stableName(container, file), data });
+      const result = await callScript({ pin, container, filename: stableName(container, item.file), data });
       if (result.ok) return;
       lastError = new Error(result.error || 'Yükleme reddedildi');
       if (result.error === 'PIN hatalı') break;
@@ -156,16 +245,19 @@ async function uploadOne(file, container) {
   throw lastError;
 }
 
-async function uploadAll(items) {
+async function uploadAll(items, container) {
   const total = items.length;
   let done = 0;
   let nextIndex = 0;
   failed = [];
+  busy = true;
+  refreshSelection();
   $('retryBtn').classList.add('hidden');
   $('bar').classList.remove('hidden');
   $('bar').max = total;
   $('bar').value = 0;
   $('status').className = '';
+  $('status').textContent = `0/${total} yüklendi`;
 
   try { wakeLock = await navigator.wakeLock?.request('screen'); } catch {}
   window.onbeforeunload = () => 'Yükleme sürüyor';
@@ -173,20 +265,20 @@ async function uploadAll(items) {
   const worker = async () => {
     while (nextIndex < total) {
       const item = items[nextIndex++];
-      try { await uploadOne(item.file, item.container); }
-      catch { failed.push(item); }
+      try { await uploadOne(item, container); }
+      catch { failed.push({ ...item, container }); }
       done += 1;
       $('bar').value = done;
-      $('status').textContent = `${done}/${total} işlendi`;
+      $('status').textContent = `${done}/${total} yüklendi`;
     }
   };
   await Promise.all(Array.from({ length: Math.min(PARALLEL, total) }, worker));
 
   window.onbeforeunload = null;
   try { await wakeLock?.release(); } catch {}
+  busy = false;
 
   const okCount = total - failed.length;
-  const container = items[0].container;
   if (failed.length === 0) {
     $('status').className = 'ok';
     $('status').textContent = `✅ ${container}: ${okCount} fotoğraf yüklendi`;
@@ -195,30 +287,32 @@ async function uploadAll(items) {
     $('status').textContent = `⚠️ ${total} fotoğraftan ${okCount} tanesi yüklendi, ${failed.length} başarısız`;
     $('retryBtn').classList.remove('hidden');
   }
+  refreshSelection();
 }
 
-function startUpload(files) {
+$('sendBtn').addEventListener('click', () => {
+  if (busy || queue.length === 0) return;
   const container = $('container').value.trim().toUpperCase().replace(/\s+/g, '');
   if (!CONTAINER_PATTERN.test(container)) {
     $('status').className = 'err';
     $('status').textContent = 'Önce konteyner numarasını yazın (ör. MSDU6983219).';
     return;
   }
-  if (files.length === 0) return;
-  uploadAll(Array.from(files).map((file) => ({ file, container })));
-}
+  const items = queue;
+  queue = [];
+  uploadAll(items, container);
+});
 
-for (const id of ['camera', 'gallery']) {
-  $(id).addEventListener('change', (event) => {
-    startUpload(event.target.files);
-    event.target.value = '';
-  });
-}
-$('retryBtn').addEventListener('click', () => { if (failed.length) uploadAll(failed.slice()); });
+$('retryBtn').addEventListener('click', () => {
+  if (busy || failed.length === 0) return;
+  const retryItems = failed.slice();
+  uploadAll(retryItems, retryItems[0].container);
+});
 
 // ---- Başlangıç ----
 (async () => {
   if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
+  refreshSelection();
   const saved = load('pin');
   if (saved) {
     try { await enter(saved); return; } catch {}

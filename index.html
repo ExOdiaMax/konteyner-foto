@@ -54,7 +54,9 @@
       <label class="btn secondary" for="gallery">🖼️ Galeri</label>
       <label class="btn secondary" for="files">📁 Dosyalar</label>
     </div>
+    <label class="btn secondary" for="folder">📂 Klasör seç (klasör adı = konteyner)</label>
     <label class="btn secondary" for="camera">📷 Fotoğraf çek</label>
+    <input id="folder" type="file" webkitdirectory multiple>
     <input id="gallery" type="file" accept="image/*" multiple>
     <input id="files" type="file" accept="*/*" multiple>
     <input id="camera" type="file" accept="image/*" capture="environment">
@@ -84,10 +86,47 @@ const IMAGE_NAME_PATTERN = /\.(jpe?g|png|webp|heic|heif)$/i;
 
 const $ = (id) => document.getElementById(id);
 let pin = null;
-let queue = [];    // seçilmiş, henüz gönderilmemiş: { file, prepared }
-let failed = [];   // gönderilemeyenler: { file, container, prepared }
+// Kuyruk öğesi: { id, file (yeniden açılışta null), name, lastModified, size, container, blob (küçültülmüş), prepared }
+let queue = [];    // seçilmiş, henüz gönderilmemiş
+let failed = [];   // gönderilemeyenler
 let busy = false;
 let wakeLock = null;
+
+// ---- Kalıcı kuyruk: küçültülen fotoğraflar yüklenene kadar telefonda saklanır ----
+const DB_NAME = 'konteyner-foto';
+const DB_STORE = 'pending';
+const dbPromise = new Promise((resolve) => {
+  try {
+    const request = indexedDB.open(DB_NAME, 1);
+    request.onupgradeneeded = () => request.result.createObjectStore(DB_STORE, { keyPath: 'id' });
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => resolve(null);
+  } catch {
+    resolve(null);   // depolama kapalıysa uygulama yalnızca bellekte çalışır
+  }
+});
+
+async function dbRun(mode, work) {
+  const db = await dbPromise;
+  if (!db) return [];
+  return new Promise((resolve) => {
+    try {
+      const tx = db.transaction(DB_STORE, mode);
+      const request = work(tx.objectStore(DB_STORE));
+      tx.oncomplete = () => resolve(request?.result || []);
+      tx.onerror = tx.onabort = () => resolve([]);
+    } catch {
+      resolve([]);
+    }
+  });
+}
+
+function persist(item) {
+  if (item.removed || !item.blob) return;
+  const { id, name, lastModified, size, container, blob } = item;
+  dbRun('readwrite', (store) => store.put({ id, name, lastModified, size, container, blob }));
+}
+function unpersist(item) { dbRun('readwrite', (store) => store.delete(item.id)); }
 
 // ---- Giriş ----
 function store(key, value) { try { value === null ? localStorage.removeItem(key) : localStorage.setItem(key, value); } catch {} }
@@ -163,7 +202,13 @@ function toBase64(blob) {
 
 function prepare(item) {
   if (!item.prepared) {
-    item.prepared = prepareLimit(async () => toBase64(await compress(item.file))).catch((error) => {
+    item.prepared = prepareLimit(async () => {
+      if (!item.blob) {
+        item.blob = await compress(item.file);
+        persist(item);
+      }
+      return toBase64(item.blob);
+    }).catch((error) => {
       item.prepared = null;   // tekrar denemede yeniden hazırlansın
       throw error;
     });
@@ -172,9 +217,9 @@ function prepare(item) {
 }
 
 // Aynı fotoğraf tekrar seçilirse aynı ad çıkar; Drive tarafı kopya oluşturmaz.
-function stableName(container, file) {
-  const base = file.name.replace(/\.[^.]+$/, '').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 40) || 'foto';
-  return `${container}_${file.lastModified}_${base}.jpg`;
+function stableName(container, item) {
+  const base = item.name.replace(/\.[^.]+$/, '').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 40) || 'foto';
+  return `${container}_${item.lastModified}_${base}_${item.size}.jpg`;
 }
 
 // ---- Seçim ----
@@ -182,34 +227,57 @@ function isImage(file) {
   return file.type.startsWith('image/') || IMAGE_NAME_PATTERN.test(file.name);
 }
 
-function fileKey(file) { return `${file.name}|${file.size}|${file.lastModified}`; }
+function fileKey(file) { return `${file.webkitRelativePath || ''}|${file.name}|${file.size}|${file.lastModified}`; }
+
+// Klasör seçiminde fotoğrafın bulunduğu klasörün adı konteyner numarasıdır.
+function folderContainer(file) {
+  const parts = (file.webkitRelativePath || '').split('/');
+  if (parts.length < 2) return null;
+  const name = parts[parts.length - 2].toUpperCase().replace(/\s+/g, '');
+  return CONTAINER_PATTERN.test(name) ? name : null;
+}
 
 function refreshSelection() {
   const hasQueue = queue.length > 0;
-  $('selected').textContent = hasQueue ? `${queue.length} fotoğraf seçildi` : '';
+  const folderNames = new Set(queue.map((item) => item.container).filter(Boolean));
+  $('selected').textContent = !hasQueue
+    ? ''
+    : folderNames.size > 0
+      ? `${queue.length} fotoğraf seçildi (${folderNames.size} konteyner klasörü)`
+      : `${queue.length} fotoğraf seçildi`;
   $('sendBtn').textContent = `Gönder (${queue.length})`;
   $('sendBtn').classList.toggle('hidden', !hasQueue);
   $('clearBtn').classList.toggle('hidden', !hasQueue);
-  $('sendBtn').disabled = busy;
-  for (const id of ['gallery', 'files', 'camera']) {
+  for (const id of ['sendBtn', 'clearBtn', 'retryBtn', 'logoutBtn', 'container']) $(id).disabled = busy;
+  for (const id of ['gallery', 'files', 'camera', 'folder']) {
     document.querySelector(`label[for=${id}]`).classList.toggle('disabled', busy);
   }
 }
 
 function addFiles(fileList) {
-  const known = new Set(queue.map((item) => fileKey(item.file)));
+  const known = new Set(queue.map((item) => item.id));
   let skipped = 0;
+  let unnamedFolder = 0;
   for (const file of fileList) {
     if (!isImage(file)) { skipped += 1; continue; }
-    if (known.has(fileKey(file))) continue;
-    known.add(fileKey(file));
-    const item = { file, prepared: null };
+    const id = fileKey(file);
+    if (known.has(id)) continue;
+    known.add(id);
+    const container = folderContainer(file);
+    if (file.webkitRelativePath && !container) unnamedFolder += 1;
+    const item = {
+      id, file, name: file.name, lastModified: file.lastModified, size: file.size,
+      container, blob: null, prepared: null
+    };
     prepare(item).catch(() => {});   // hata gönderirken bildirilir
     queue.push(item);
   }
-  if (skipped) {
+  const notes = [];
+  if (skipped) notes.push(`${skipped} dosya fotoğraf olmadığı için atlandı.`);
+  if (unnamedFolder) notes.push(`${unnamedFolder} fotoğrafın klasör adı geçerli bir konteyner numarası değil; bunlar için yukarıdaki kutuya numara yazın.`);
+  if (notes.length) {
     $('status').className = 'err';
-    $('status').textContent = `${skipped} dosya fotoğraf olmadığı için atlandı.`;
+    $('status').textContent = notes.join(' ');
   }
   refreshSelection();
 }
@@ -221,20 +289,36 @@ for (const id of ['gallery', 'files', 'camera']) {
   });
 }
 
+$('folder').addEventListener('change', (event) => {
+  const files = Array.from(event.target.files);
+  event.target.value = '';
+  if (files.length > 0 && !files.some((file) => file.webkitRelativePath)) {
+    $('status').className = 'err';
+    $('status').textContent = 'Bu telefon klasör seçmeyi desteklemiyor. Galeri veya Dosyalar düğmesini kullanın.';
+    return;
+  }
+  addFiles(files);
+});
+
 $('clearBtn').addEventListener('click', () => {
+  for (const item of queue) {
+    item.removed = true;
+    unpersist(item);
+  }
   queue = [];
   $('status').textContent = '';
   refreshSelection();
 });
 
 // ---- Yükleme ----
-async function uploadOne(item, container) {
+async function uploadOne(item) {
+  const container = item.container;
   const data = await prepare(item);
   let lastError;
   for (let attempt = 1; attempt <= RETRIES; attempt += 1) {
     try {
-      const result = await callScript({ pin, container, filename: stableName(container, item.file), data });
-      if (result.ok) return;
+      const result = await callScript({ pin, container, filename: stableName(container, item), data });
+      if (result.ok) { unpersist(item); return; }
       lastError = new Error(result.error || 'Yükleme reddedildi');
       if (result.error === 'PIN hatalı') break;
     } catch (error) {
@@ -245,7 +329,7 @@ async function uploadOne(item, container) {
   throw lastError;
 }
 
-async function uploadAll(items, container) {
+async function uploadAll(items) {
   const total = items.length;
   let done = 0;
   let nextIndex = 0;
@@ -265,8 +349,8 @@ async function uploadAll(items, container) {
   const worker = async () => {
     while (nextIndex < total) {
       const item = items[nextIndex++];
-      try { await uploadOne(item, container); }
-      catch { failed.push({ ...item, container }); }
+      try { await uploadOne(item); }
+      catch { failed.push(item); }
       done += 1;
       $('bar').value = done;
       $('status').textContent = `${done}/${total} yüklendi`;
@@ -279,9 +363,12 @@ async function uploadAll(items, container) {
   busy = false;
 
   const okCount = total - failed.length;
+  const containers = new Set(items.map((item) => item.container));
   if (failed.length === 0) {
     $('status').className = 'ok';
-    $('status').textContent = `✅ ${container}: ${okCount} fotoğraf yüklendi`;
+    $('status').textContent = containers.size === 1
+      ? `✅ ${items[0].container}: ${okCount} fotoğraf yüklendi`
+      : `✅ ${containers.size} konteyner, ${okCount} fotoğraf yüklendi`;
   } else {
     $('status').className = 'err';
     $('status').textContent = `⚠️ ${total} fotoğraftan ${okCount} tanesi yüklendi, ${failed.length} başarısız`;
@@ -292,26 +379,39 @@ async function uploadAll(items, container) {
 
 $('sendBtn').addEventListener('click', () => {
   if (busy || queue.length === 0) return;
-  const container = $('container').value.trim().toUpperCase().replace(/\s+/g, '');
-  if (!CONTAINER_PATTERN.test(container)) {
+  const typed = $('container').value.trim().toUpperCase().replace(/\s+/g, '');
+  const needsTyped = queue.some((item) => !item.container);
+  if (needsTyped && !CONTAINER_PATTERN.test(typed)) {
     $('status').className = 'err';
     $('status').textContent = 'Önce konteyner numarasını yazın (ör. MSDU6983219).';
     return;
   }
   const items = queue;
+  for (const item of items) {
+    item.container = item.container || typed;
+    persist(item);   // konteyner bilgisiyle kaydedilir; uygulama kapansa da kaldığı yerden devam eder
+  }
   queue = [];
-  uploadAll(items, container);
+  uploadAll(items);
 });
 
 $('retryBtn').addEventListener('click', () => {
   if (busy || failed.length === 0) return;
-  const retryItems = failed.slice();
-  uploadAll(retryItems, retryItems[0].container);
+  uploadAll(failed.slice());
 });
 
 // ---- Başlangıç ----
 (async () => {
   if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
+
+  const saved_items = await dbRun('readonly', (store) => store.getAll());
+  for (const record of saved_items) {
+    queue.push({ ...record, file: null, prepared: null });
+  }
+  if (queue.length > 0) {
+    $('status').className = 'err';
+    $('status').textContent = `⏳ Önceki yüklemeden ${queue.length} fotoğraf bekliyor. Devam etmek için Gönder'e basın.`;
+  }
   refreshSelection();
   const saved = load('pin');
   if (saved) {

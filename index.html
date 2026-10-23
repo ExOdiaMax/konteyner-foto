@@ -32,6 +32,18 @@
   #status { font-weight:600; }
   .ok { color:var(--ok); } .err { color:var(--err); }
   .muted { color:var(--muted); font-size:14px; }
+  input.plain { text-transform:none; letter-spacing:0; }
+  .userRow { display:grid; gap:8px; padding:12px; border:1px solid var(--muted); border-radius:10px; }
+  .userRow .btns { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+  .userRow button { padding:10px; font-size:15px; }
+  .overlay { position:fixed; inset:0; background:rgba(0,0,0,.55); display:flex; align-items:flex-end; justify-content:center; z-index:10; }
+  .sheet { background:var(--card); width:100%; max-width:480px; max-height:80vh; overflow:auto; border-radius:16px 16px 0 0; padding:16px; display:grid; gap:10px; }
+  .sheet button { padding:14px; font-size:17px; }
+  .camera { position:fixed; inset:0; background:#000; z-index:20; }
+  .camera video { width:100%; height:100%; object-fit:contain; }
+  #camCount { position:absolute; top:16px; left:0; right:0; text-align:center; color:#fff; font-weight:600; text-shadow:0 1px 4px #000; }
+  #shutter { position:absolute; bottom:28px; left:50%; width:76px; height:76px; margin-left:-38px; padding:0; border-radius:50%; background:#fff; border:6px solid rgba(255,255,255,.5); background-clip:padding-box; }
+  #camDone { position:absolute; bottom:44px; right:20px; width:auto; padding:12px 22px; }
   .hidden { display:none; }
 </style>
 </head>
@@ -43,6 +55,30 @@
     <input id="pin" type="password" inputmode="numeric" autocomplete="off">
     <button id="loginBtn">Giriş yap</button>
     <div id="loginMsg" class="err"></div>
+    <button id="adminOpenBtn" class="secondary">Yönetici girişi</button>
+  </section>
+
+  <section id="adminLogin" class="card hidden">
+    <h1>Yönetici girişi</h1>
+    <label for="adminUser">Kullanıcı adı</label>
+    <input id="adminUser" class="plain" type="text" autocapitalize="none" autocomplete="off">
+    <label for="adminPass">Şifre</label>
+    <input id="adminPass" type="password" autocomplete="off">
+    <button id="adminLoginBtn">Giriş yap</button>
+    <button id="adminBackBtn" class="secondary">Geri</button>
+    <div id="adminLoginMsg" class="err"></div>
+  </section>
+
+  <section id="admin" class="card hidden">
+    <h1>Yönetici paneli</h1>
+    <div id="adminUsers" class="muted">Yükleniyor...</div>
+    <label for="newName">Yeni kullanıcı adı</label>
+    <input id="newName" class="plain" type="text" autocomplete="off" maxlength="30">
+    <label for="newPin">PIN (boş bırakırsanız otomatik, 6-12 rakam)</label>
+    <input id="newPin" class="plain" type="text" inputmode="numeric" autocomplete="off" maxlength="12">
+    <button id="adminAddBtn">Kullanıcı ekle</button>
+    <div id="adminMsg"></div>
+    <button id="adminLogoutBtn" class="secondary">Yönetici çıkışı</button>
   </section>
 
   <section id="app" class="card hidden">
@@ -50,15 +86,14 @@
     <label for="container">Konteyner numarası</label>
     <input id="container" type="text" autocapitalize="characters" autocomplete="off" placeholder="MSDU6983219" maxlength="32">
 
+    <button id="historyBtn" class="secondary">📁 Yüklenen klasörlerim</button>
+    <button id="cameraBtn" class="secondary">📷 Fotoğraf çek</button>
     <div class="row">
       <label class="btn secondary" for="gallery">🖼️ Galeri</label>
-      <label class="btn secondary" for="files">📁 Dosyalar</label>
+      <label class="btn secondary" for="folder">📂 Klasör seç</label>
     </div>
-    <label class="btn secondary" for="folder">📂 Klasör seç (klasör adı = konteyner)</label>
-    <label class="btn secondary" for="camera">📷 Fotoğraf çek</label>
     <input id="folder" type="file" webkitdirectory multiple>
     <input id="gallery" type="file" accept="image/*" multiple>
-    <input id="files" type="file" accept="*/*" multiple>
     <input id="camera" type="file" accept="image/*" capture="environment">
 
     <div id="selected"></div>
@@ -73,6 +108,21 @@
   </section>
 </main>
 
+<div id="sheet" class="overlay hidden">
+  <div class="sheet">
+    <h1>Yüklenen klasörlerim</h1>
+    <div id="sheetList" class="muted"></div>
+    <button id="sheetClose" class="secondary">Kapat</button>
+  </div>
+</div>
+
+<div id="cam" class="camera hidden">
+  <video id="camVideo" playsinline muted autoplay></video>
+  <div id="camCount"></div>
+  <button id="shutter" aria-label="Fotoğraf çek"></button>
+  <button id="camDone">Bitti</button>
+</div>
+
 <script>
 // ---- Ayarlar ----
 const APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbwQgMh6jhLZgEqGC2DbDXFZ5vrACW_9NAWG6fGQ3VJcXF7SNzLg2JAfJfPsyufD-sGtfQ/exec';
@@ -81,7 +131,8 @@ const JPEG_QUALITY = 0.75;
 const PARALLEL = 6;         // aynı anda yüklenen fotoğraf
 const PREPARE_PARALLEL = 2; // aynı anda küçültülen fotoğraf (telefon belleği için sınırlı)
 const RETRIES = 3;
-const CONTAINER_PATTERN = /^[A-Z0-9][A-Z0-9_-]{2,31}$/;
+const CAMERA_MAX_SIDE = 1600; // uygulama içi kamerada uzun kenar (galeri fotoğrafları SCALE ile küçülür)
+const CONTAINER_PATTERN = /^[A-Z0-9][A-Z0-9_-]{0,31}$/;
 const IMAGE_NAME_PATTERN = /\.(jpe?g|png|webp|heic|heif)$/i;
 
 const $ = (id) => document.getElementById(id);
@@ -243,13 +294,13 @@ function refreshSelection() {
   $('selected').textContent = !hasQueue
     ? ''
     : folderNames.size > 0
-      ? `${queue.length} fotoğraf seçildi (${folderNames.size} konteyner klasörü)`
-      : `${queue.length} fotoğraf seçildi`;
+      ? `${queue.length} fotoğraf hazır (${folderNames.size} konteyner klasörü)`
+      : `${queue.length} fotoğraf hazır`;
   $('sendBtn').textContent = `Gönder (${queue.length})`;
   $('sendBtn').classList.toggle('hidden', !hasQueue);
   $('clearBtn').classList.toggle('hidden', !hasQueue);
-  for (const id of ['sendBtn', 'clearBtn', 'retryBtn', 'logoutBtn', 'container']) $(id).disabled = busy;
-  for (const id of ['gallery', 'files', 'camera', 'folder']) {
+  for (const id of ['sendBtn', 'clearBtn', 'retryBtn', 'logoutBtn', 'container', 'cameraBtn', 'historyBtn']) $(id).disabled = busy;
+  for (const id of ['gallery', 'folder']) {
     document.querySelector(`label[for=${id}]`).classList.toggle('disabled', busy);
   }
 }
@@ -282,7 +333,7 @@ function addFiles(fileList) {
   refreshSelection();
 }
 
-for (const id of ['gallery', 'files', 'camera']) {
+for (const id of ['gallery', 'camera']) {
   $(id).addEventListener('change', (event) => {
     addFiles(Array.from(event.target.files));
     event.target.value = '';
@@ -294,7 +345,7 @@ $('folder').addEventListener('change', (event) => {
   event.target.value = '';
   if (files.length > 0 && !files.some((file) => file.webkitRelativePath)) {
     $('status').className = 'err';
-    $('status').textContent = 'Bu telefon klasör seçmeyi desteklemiyor. Galeri veya Dosyalar düğmesini kullanın.';
+    $('status').textContent = 'Bu telefon klasör seçmeyi desteklemiyor. Galeri düğmesini kullanın.';
     return;
   }
   addFiles(files);
@@ -310,6 +361,117 @@ $('clearBtn').addEventListener('click', () => {
   refreshSelection();
 });
 
+// ---- Uygulama içi kamera: ekrandan çıkmadan art arda çekim, her fotoğraf kuyruğa eklenir ----
+let camStream = null;
+let camCount = 0;
+let shotCounter = 0;
+
+function updateCamCount() {
+  $('camCount').textContent = `${camCount} fotoğraf çekildi · toplam ${queue.length} hazır`;
+}
+
+async function openCamera() {
+  if (!navigator.mediaDevices?.getUserMedia) {
+    $('camera').click();   // eski tarayıcı: telefonun kendi kamerası (tek çekim)
+    return;
+  }
+  try {
+    camStream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: { ideal: 'environment' }, width: { ideal: 2560 }, height: { ideal: 1920 } },
+      audio: false
+    });
+  } catch {
+    $('status').className = 'err';
+    $('status').textContent = 'Kamera açılamadı. Tarayıcıda bu site için kamera iznini açın.';
+    return;
+  }
+  $('camVideo').srcObject = camStream;
+  camCount = 0;
+  updateCamCount();
+  $('cam').classList.remove('hidden');
+  $('camVideo').play().catch(() => {});
+}
+
+function closeCamera() {
+  camStream?.getTracks().forEach((track) => track.stop());
+  camStream = null;
+  $('camVideo').srcObject = null;
+  $('cam').classList.add('hidden');
+  $('status').textContent = '';
+  refreshSelection();
+}
+
+function shoot() {
+  const video = $('camVideo');
+  if (!video.videoWidth) return;
+  const ratio = Math.min(1, CAMERA_MAX_SIDE / Math.max(video.videoWidth, video.videoHeight));
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.round(video.videoWidth * ratio);
+  canvas.height = Math.round(video.videoHeight * ratio);
+  canvas.getContext('2d').drawImage(video, 0, 0, canvas.width, canvas.height);
+  navigator.vibrate?.(20);
+  video.style.opacity = '.3';
+  setTimeout(() => { video.style.opacity = ''; }, 80);
+  canvas.toBlob((blob) => {
+    if (!blob) return;
+    shotCounter += 1;
+    camCount += 1;
+    const now = Date.now();
+    const item = {
+      id: `kamera|${now}|${shotCounter}`, file: null, name: `kamera${shotCounter}`,
+      lastModified: now, size: blob.size, container: null, blob, prepared: null
+    };
+    queue.push(item);
+    persist(item);
+    updateCamCount();
+  }, 'image/jpeg', JPEG_QUALITY);
+}
+
+$('cameraBtn').addEventListener('click', openCamera);
+$('shutter').addEventListener('click', shoot);
+$('camDone').addEventListener('click', closeCamera);
+document.addEventListener('visibilitychange', () => { if (document.hidden && camStream) closeCamera(); });
+
+// ---- Yüklenen klasörlerim: daha önce yüklenen konteynerler, birine dokununca numarası kutuya yazılır ----
+function closeSheet() { $('sheet').classList.add('hidden'); }
+
+function formatDate(ms) {
+  return new Date(ms).toLocaleString('tr-TR', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
+}
+
+async function openHistory() {
+  const list = $('sheetList');
+  list.textContent = 'Yükleniyor...';
+  $('sheet').classList.remove('hidden');
+  try {
+    const result = await callScript({ action: 'list', pin });
+    if (!result.ok) throw new Error(result.error || 'Liste alınamadı');
+    const folders = result.folders.filter((folder) => CONTAINER_PATTERN.test(folder.name));
+    if (folders.length === 0) {
+      list.textContent = 'Henüz yüklenmiş klasör yok.';
+      return;
+    }
+    list.textContent = '';
+    for (const folder of folders) {
+      const button = document.createElement('button');
+      button.className = 'secondary';
+      button.textContent = `${folder.name} · ${formatDate(folder.updated)}`;
+      button.addEventListener('click', () => {
+        $('container').value = folder.name;
+        closeSheet();
+        $('status').className = 'ok';
+        $('status').textContent = `Klasör seçildi: ${folder.name}. Fotoğraf ekleyip Gönder'e basın.`;
+      });
+      list.appendChild(button);
+    }
+  } catch (error) {
+    list.textContent = `Liste alınamadı: ${error.message}`;
+  }
+}
+
+$('historyBtn').addEventListener('click', openHistory);
+$('sheetClose').addEventListener('click', closeSheet);
+
 // ---- Yükleme ----
 async function uploadOne(item) {
   const container = item.container;
@@ -320,7 +482,7 @@ async function uploadOne(item) {
       const result = await callScript({ pin, container, filename: stableName(container, item), data });
       if (result.ok) { unpersist(item); return; }
       lastError = new Error(result.error || 'Yükleme reddedildi');
-      if (result.error === 'PIN hatalı') break;
+      if (result.error === 'PIN hatalı' || result.error === 'Hesabınız engellendi') break;
     } catch (error) {
       lastError = error;
     }
@@ -398,6 +560,101 @@ $('sendBtn').addEventListener('click', () => {
 $('retryBtn').addEventListener('click', () => {
   if (busy || failed.length === 0) return;
   uploadAll(failed.slice());
+});
+
+// ---- Yönetici paneli ----
+let adminToken = null;
+
+function showOnly(sectionId) {
+  for (const id of ['login', 'adminLogin', 'admin']) $(id).classList.toggle('hidden', id !== sectionId);
+}
+
+function adminMessage(text, isError) {
+  $('adminMsg').className = isError ? 'err' : 'ok';
+  $('adminMsg').textContent = text;
+}
+
+function renderUsers(users) {
+  const list = $('adminUsers');
+  list.textContent = '';
+  for (const user of users) {
+    const row = document.createElement('div');
+    row.className = 'userRow';
+
+    const title = document.createElement('div');
+    title.style.fontWeight = '600';
+    title.textContent = `${user.name} · PIN: ${user.pin}${user.blocked ? ' · ⛔ engelli' : ''}`;
+
+    const blockBtn = document.createElement('button');
+    blockBtn.className = 'secondary';
+    blockBtn.textContent = user.blocked ? 'Engeli kaldır' : 'Engelle';
+    blockBtn.addEventListener('click', () => runAdmin(
+      { action: 'adminSetBlocked', pin: user.pin, blocked: !user.blocked },
+      user.blocked ? `${user.name} için engel kaldırıldı` : `${user.name} engellendi`
+    ));
+
+    const pinBtn = document.createElement('button');
+    pinBtn.className = 'secondary';
+    pinBtn.textContent = 'PIN değiştir';
+    pinBtn.addEventListener('click', () => {
+      if (!confirm(`${user.name} için yeni PIN oluşturulsun mu? Eski PIN hemen geçersiz olur.`)) return;
+      runAdmin({ action: 'adminChangePin', pin: user.pin }, `${user.name} için yeni PIN oluşturuldu`);
+    });
+
+    const buttons = document.createElement('div');
+    buttons.className = 'btns';
+    buttons.append(blockBtn, pinBtn);
+    row.append(title, buttons);
+    list.appendChild(row);
+  }
+}
+
+async function runAdmin(payload, okText) {
+  try {
+    const result = await callScript({ ...payload, token: adminToken });
+    if (!result.ok) throw new Error(result.error || 'İşlem başarısız');
+    renderUsers(result.users);
+    adminMessage(okText, false);
+    return true;
+  } catch (error) {
+    adminMessage(error.message, true);
+    return false;
+  }
+}
+
+$('adminOpenBtn').addEventListener('click', () => showOnly('adminLogin'));
+$('adminBackBtn').addEventListener('click', () => showOnly('login'));
+
+$('adminLoginBtn').addEventListener('click', async () => {
+  $('adminLoginMsg').textContent = '';
+  try {
+    const result = await callScript({ action: 'adminLogin', user: $('adminUser').value.trim(), password: $('adminPass').value });
+    if (!result.ok) throw new Error(result.error || 'Giriş başarısız');
+    adminToken = result.token;
+    $('adminPass').value = '';
+    showOnly('admin');
+    await runAdmin({ action: 'adminList' }, '');
+  } catch (error) {
+    $('adminLoginMsg').textContent = error.message;
+  }
+});
+
+$('adminAddBtn').addEventListener('click', async () => {
+  const added = await runAdmin(
+    { action: 'adminAdd', name: $('newName').value.trim(), pin: $('newPin').value.trim() },
+    'Kullanıcı eklendi'
+  );
+  if (added) {
+    $('newName').value = '';
+    $('newPin').value = '';
+  }
+});
+
+$('adminLogoutBtn').addEventListener('click', () => {
+  adminToken = null;
+  $('adminUsers').textContent = '';
+  adminMessage('', false);
+  showOnly('login');
 });
 
 // ---- Başlangıç ----

@@ -39,7 +39,18 @@
   .overlay { position:fixed; inset:0; background:rgba(0,0,0,.55); display:flex; align-items:flex-end; justify-content:center; z-index:10; }
   .sheet { background:var(--card); width:100%; max-width:480px; max-height:80vh; overflow:auto; border-radius:16px 16px 0 0; padding:16px; display:grid; gap:10px; }
   .sheet button { padding:14px; font-size:17px; }
-  .camera { position:fixed; inset:0; background:#000; z-index:20; }
+  .grid { display:grid; grid-template-columns:repeat(3,1fr); gap:6px; }
+  .grid img { width:100%; aspect-ratio:1; object-fit:cover; border-radius:8px; background:var(--bg); }
+  .sheet.tall { max-height:92vh; }
+  .big { position:fixed; inset:0; background:#000; z-index:30; display:flex; align-items:center; justify-content:center; color:#fff; }
+  .big img { max-width:100%; max-height:100%; }
+  #bigMsg { position:absolute; }
+  #bigClose { position:absolute; top:12px; right:12px; width:auto; padding:10px 18px; }
+  .camTools { position:absolute; left:16px; right:16px; bottom:124px; display:flex; align-items:center; gap:12px; color:#fff; }
+  .zoomWrap { display:flex; align-items:center; gap:8px; flex:1; }
+  .zoomWrap input { flex:1; }
+  #torchBtn { width:auto; padding:8px 14px; font-size:20px; background:rgba(255,255,255,.25); }
+  .camera { position:fixed; inset:0; background:#000; z-index:20; touch-action:none; }
   .camera video { width:100%; height:100%; object-fit:contain; }
   #camCount { position:absolute; top:16px; left:0; right:0; text-align:center; color:#fff; font-weight:600; text-shadow:0 1px 4px #000; }
   #shutter { position:absolute; bottom:28px; left:50%; width:76px; height:76px; margin-left:-38px; padding:0; border-radius:50%; background:#fff; border:6px solid rgba(255,255,255,.5); background-clip:padding-box; }
@@ -87,6 +98,7 @@
     <input id="container" type="text" autocapitalize="characters" autocomplete="off" placeholder="MSDU6983219" maxlength="32">
 
     <button id="historyBtn" class="secondary">📁 Yüklenen klasörlerim</button>
+    <button id="viewBtn" class="secondary hidden">👁 Klasördeki fotoğrafları gör</button>
     <button id="cameraBtn" class="secondary">📷 Fotoğraf çek</button>
     <div class="row">
       <label class="btn secondary" for="gallery">🖼️ Galeri</label>
@@ -116,9 +128,32 @@
   </div>
 </div>
 
+<div id="viewOverlay" class="overlay hidden">
+  <div class="sheet tall">
+    <h1 id="viewTitle"></h1>
+    <div id="viewMsg" class="muted"></div>
+    <div id="viewGrid" class="grid"></div>
+    <button id="viewClose" class="secondary">Kapat</button>
+  </div>
+</div>
+
+<div id="bigOverlay" class="big hidden">
+  <img id="bigImg" alt="">
+  <div id="bigMsg"></div>
+  <button id="bigClose">Kapat</button>
+</div>
+
 <div id="cam" class="camera hidden">
   <video id="camVideo" playsinline muted autoplay></video>
   <div id="camCount"></div>
+  <div id="camTools" class="camTools hidden">
+    <div id="zoomWrap" class="zoomWrap hidden">
+      <span>🔍</span>
+      <input id="zoomRange" type="range">
+      <span id="zoomLabel"></span>
+    </div>
+    <button id="torchBtn" class="hidden" aria-label="Fener">🔦</button>
+  </div>
   <button id="shutter" aria-label="Fotoğraf çek"></button>
   <button id="camDone">Bitti</button>
 </div>
@@ -299,7 +334,7 @@ function refreshSelection() {
   $('sendBtn').textContent = `Gönder (${queue.length})`;
   $('sendBtn').classList.toggle('hidden', !hasQueue);
   $('clearBtn').classList.toggle('hidden', !hasQueue);
-  for (const id of ['sendBtn', 'clearBtn', 'retryBtn', 'logoutBtn', 'container', 'cameraBtn', 'historyBtn']) $(id).disabled = busy;
+  for (const id of ['sendBtn', 'clearBtn', 'retryBtn', 'logoutBtn', 'container', 'cameraBtn', 'historyBtn', 'viewBtn']) $(id).disabled = busy;
   for (const id of ['gallery', 'folder']) {
     document.querySelector(`label[for=${id}]`).classList.toggle('disabled', busy);
   }
@@ -390,11 +425,76 @@ async function openCamera() {
   updateCamCount();
   $('cam').classList.remove('hidden');
   $('camVideo').play().catch(() => {});
+  setupCameraTools();
 }
+
+// Yakınlaştırma ve fener yalnızca telefonun kamerası destekliyorsa görünür.
+let camTrack = null;
+let zoomLimits = null;
+let torchOn = false;
+let pinch = null;
+
+function applyCameraConstraint(constraint) {
+  camTrack?.applyConstraints({ advanced: [constraint] }).catch(() => {});
+}
+
+function showZoom(value) { $('zoomLabel').textContent = `${Number(value).toFixed(1)}×`; }
+
+function setupCameraTools() {
+  camTrack = camStream.getVideoTracks()[0];
+  const caps = camTrack.getCapabilities?.() || {};
+  zoomLimits = caps.zoom ? { min: caps.zoom.min, max: caps.zoom.max } : null;
+  torchOn = false;
+  $('zoomWrap').classList.toggle('hidden', !zoomLimits);
+  $('torchBtn').classList.toggle('hidden', !caps.torch);
+  $('camTools').classList.toggle('hidden', !zoomLimits && !caps.torch);
+  if (zoomLimits) {
+    const range = $('zoomRange');
+    range.min = caps.zoom.min;
+    range.max = caps.zoom.max;
+    range.step = caps.zoom.step || 0.1;
+    range.value = camTrack.getSettings().zoom || caps.zoom.min;
+    showZoom(range.value);
+  }
+}
+
+$('zoomRange').addEventListener('input', (event) => {
+  showZoom(event.target.value);
+  applyCameraConstraint({ zoom: Number(event.target.value) });
+});
+
+$('torchBtn').addEventListener('click', () => {
+  torchOn = !torchOn;
+  $('torchBtn').style.opacity = torchOn ? '1' : '.6';
+  applyCameraConstraint({ torch: torchOn });
+});
+
+function touchDistance(touches) {
+  return Math.hypot(touches[0].clientX - touches[1].clientX, touches[0].clientY - touches[1].clientY);
+}
+
+$('camVideo').addEventListener('touchstart', (event) => {
+  if (event.touches.length === 2 && zoomLimits) {
+    pinch = { distance: touchDistance(event.touches), zoom: Number($('zoomRange').value) };
+  }
+});
+$('camVideo').addEventListener('touchmove', (event) => {
+  if (!pinch || event.touches.length !== 2) return;
+  event.preventDefault();
+  const wanted = pinch.zoom * (touchDistance(event.touches) / pinch.distance);
+  const zoom = Math.min(zoomLimits.max, Math.max(zoomLimits.min, wanted));
+  $('zoomRange').value = zoom;
+  showZoom(zoom);
+  applyCameraConstraint({ zoom });
+}, { passive: false });
+$('camVideo').addEventListener('touchend', () => { pinch = null; });
 
 function closeCamera() {
   camStream?.getTracks().forEach((track) => track.stop());
   camStream = null;
+  camTrack = null;
+  zoomLimits = null;
+  $('camTools').classList.add('hidden');
   $('camVideo').srcObject = null;
   $('cam').classList.add('hidden');
   $('status').textContent = '';
@@ -458,6 +558,7 @@ async function openHistory() {
       button.textContent = `${folder.name} · ${formatDate(folder.updated)}`;
       button.addEventListener('click', () => {
         $('container').value = folder.name;
+        updateViewBtn();
         closeSheet();
         $('status').className = 'ok';
         $('status').textContent = `Klasör seçildi: ${folder.name}. Fotoğraf ekleyip Gönder'e basın.`;
@@ -471,6 +572,92 @@ async function openHistory() {
 
 $('historyBtn').addEventListener('click', openHistory);
 $('sheetClose').addEventListener('click', closeSheet);
+
+// ---- Klasördeki fotoğrafları görme (yalnızca görüntüleme; silme yok) ----
+let viewRun = 0;
+let bigRun = 0;
+
+function typedContainer() { return $('container').value.trim().toUpperCase().replace(/\s+/g, ''); }
+
+function updateViewBtn() {
+  $('viewBtn').classList.toggle('hidden', !CONTAINER_PATTERN.test(typedContainer()));
+}
+$('container').addEventListener('input', updateViewBtn);
+
+async function openView() {
+  const container = typedContainer();
+  const run = ++viewRun;
+  $('viewTitle').textContent = container;
+  $('viewGrid').textContent = '';
+  $('viewMsg').textContent = 'Yükleniyor...';
+  $('viewOverlay').classList.remove('hidden');
+  try {
+    const result = await callScript({ action: 'photos', pin, container });
+    if (!result.ok) throw new Error(result.error || 'Liste alınamadı');
+    if (run !== viewRun) return;
+    const names = result.photos.map((photo) => photo.name);
+    if (names.length === 0) {
+      $('viewMsg').textContent = 'Bu klasörde henüz fotoğraf yok.';
+      return;
+    }
+    $('viewTitle').textContent = `${container} · ${names.length} fotoğraf`;
+    $('viewMsg').textContent = '';
+
+    const images = new Map();
+    for (const name of names) {
+      const img = document.createElement('img');
+      img.alt = '';
+      img.addEventListener('click', () => openBig(container, name));
+      images.set(name, img);
+      $('viewGrid').appendChild(img);
+    }
+
+    const batches = [];
+    for (let i = 0; i < names.length; i += 8) batches.push(names.slice(i, i + 8));
+    let next = 0;
+    const loader = async () => {
+      while (next < batches.length && run === viewRun) {
+        const batch = batches[next++];
+        try {
+          const thumbs = await callScript({ action: 'thumbs', pin, container, names: batch });
+          if (!thumbs.ok) continue;
+          for (const thumb of thumbs.thumbs) images.get(thumb.name).src = `data:${thumb.type};base64,${thumb.data}`;
+        } catch {
+          // bu gruptaki küçük resimler boş kalır
+        }
+      }
+    };
+    await Promise.all([loader(), loader()]);
+  } catch (error) {
+    if (run === viewRun) $('viewMsg').textContent = `Fotoğraflar alınamadı: ${error.message}`;
+  }
+}
+
+async function openBig(container, name) {
+  const run = ++bigRun;
+  $('bigImg').removeAttribute('src');
+  $('bigMsg').textContent = 'Yükleniyor...';
+  $('bigOverlay').classList.remove('hidden');
+  try {
+    const result = await callScript({ action: 'photo', pin, container, name });
+    if (!result.ok) throw new Error(result.error || 'Açılamadı');
+    if (run !== bigRun) return;
+    $('bigImg').src = `data:${result.type};base64,${result.data}`;
+    $('bigMsg').textContent = '';
+  } catch (error) {
+    if (run === bigRun) $('bigMsg').textContent = `Fotoğraf açılamadı: ${error.message}`;
+  }
+}
+
+$('viewBtn').addEventListener('click', openView);
+$('viewClose').addEventListener('click', () => {
+  viewRun += 1;
+  $('viewOverlay').classList.add('hidden');
+});
+$('bigClose').addEventListener('click', () => {
+  bigRun += 1;
+  $('bigOverlay').classList.add('hidden');
+});
 
 // ---- Yükleme ----
 async function uploadOne(item) {
@@ -545,7 +732,7 @@ async function uploadAll(items) {
 
 $('sendBtn').addEventListener('click', () => {
   if (busy || queue.length === 0) return;
-  const typed = $('container').value.trim().toUpperCase().replace(/\s+/g, '');
+  const typed = typedContainer();
   const needsTyped = queue.some((item) => !item.container);
   if (needsTyped && !CONTAINER_PATTERN.test(typed)) {
     $('status').className = 'err';

@@ -495,6 +495,7 @@ async function uploadAll(items) {
   const total = items.length;
   let done = 0;
   let nextIndex = 0;
+  let lastError = '';
   failed = [];
   busy = true;
   refreshSelection();
@@ -512,7 +513,10 @@ async function uploadAll(items) {
     while (nextIndex < total) {
       const item = items[nextIndex++];
       try { await uploadOne(item); }
-      catch { failed.push(item); }
+      catch (error) {
+        failed.push(item);
+        lastError = error.message;
+      }
       done += 1;
       $('bar').value = done;
       $('status').textContent = `${done}/${total} yüklendi`;
@@ -533,7 +537,7 @@ async function uploadAll(items) {
       : `✅ ${containers.size} konteyner, ${okCount} fotoğraf yüklendi`;
   } else {
     $('status').className = 'err';
-    $('status').textContent = `⚠️ ${total} fotoğraftan ${okCount} tanesi yüklendi, ${failed.length} başarısız`;
+    $('status').textContent = `⚠️ ${total} fotoğraftan ${okCount} tanesi yüklendi, ${failed.length} başarısız. Son hata: ${lastError}`;
     $('retryBtn').classList.remove('hidden');
   }
   refreshSelection();

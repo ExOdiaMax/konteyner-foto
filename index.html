@@ -51,7 +51,7 @@
   .camTools { position:absolute; left:16px; right:16px; bottom:124px; display:flex; align-items:center; gap:12px; color:#fff; }
   .zoomWrap { display:flex; align-items:center; gap:8px; flex:1; }
   .zoomWrap input { flex:1; }
-  #torchBtn { width:auto; padding:8px 14px; font-size:20px; background:rgba(255,255,255,.25); }
+  #torchBtn { width:auto; padding:10px 14px; font-size:15px; background:rgba(255,255,255,.25); }
   .camera { position:fixed; inset:0; background:#000; z-index:20; touch-action:none; }
   .camera video { width:100%; height:100%; object-fit:contain; }
   #camCount { position:absolute; top:16px; left:0; right:0; text-align:center; color:#fff; font-weight:600; text-shadow:0 1px 4px #000; }
@@ -179,6 +179,7 @@ const PARALLEL = 6;         // aynı anda yüklenen fotoğraf
 const PREPARE_PARALLEL = 2; // aynı anda küçültülen fotoğraf (telefon belleği için sınırlı)
 const RETRIES = 3;
 const CAMERA_MAX_SIDE = 1600; // uygulama içi kamerada uzun kenar (galeri fotoğrafları SCALE ile küçülür)
+const DARK_LUMA = 70;         // otomatik flaş: ortalama parlaklık (0-255) bunun altındaysa ışık yanar
 const CONTAINER_PATTERN = /^[A-Z0-9][A-Z0-9_-]{0,31}$/;
 const IMAGE_NAME_PATTERN = /\.(jpe?g|png|webp|heic|heif)$/i;
 
@@ -444,7 +445,9 @@ async function openCamera() {
 // Yakınlaştırma ve fener yalnızca telefonun kamerası destekliyorsa görünür.
 let camTrack = null;
 let zoomLimits = null;
-let torchOn = false;
+let torchSupported = false;
+let flashMode = 'off';   // 'off' | 'on' | 'auto'
+let shooting = false;
 let pinch = null;
 
 function applyCameraConstraint(constraint) {
@@ -457,7 +460,9 @@ function setupCameraTools() {
   camTrack = camStream.getVideoTracks()[0];
   const caps = camTrack.getCapabilities?.() || {};
   zoomLimits = caps.zoom ? { min: caps.zoom.min, max: caps.zoom.max } : null;
-  torchOn = false;
+  torchSupported = Boolean(caps.torch);
+  flashMode = 'off';
+  showFlashMode();
   $('zoomWrap').classList.toggle('hidden', !zoomLimits);
   $('torchBtn').classList.toggle('hidden', !caps.torch);
   $('camTools').classList.toggle('hidden', !zoomLimits && !caps.torch);
@@ -476,11 +481,29 @@ $('zoomRange').addEventListener('input', (event) => {
   applyCameraConstraint({ zoom: Number(event.target.value) });
 });
 
+function showFlashMode() {
+  $('torchBtn').textContent = { off: '🔦 Kapalı', on: '🔦 Açık', auto: '🔦 Otomatik' }[flashMode];
+  $('torchBtn').style.opacity = flashMode === 'off' ? '.6' : '1';
+}
+
+// Kapalı → Açık (sürekli ışık) → Otomatik (karanlıktaysa yalnızca çekim anında ışık yanar)
 $('torchBtn').addEventListener('click', () => {
-  torchOn = !torchOn;
-  $('torchBtn').style.opacity = torchOn ? '1' : '.6';
-  applyCameraConstraint({ torch: torchOn });
+  flashMode = { off: 'on', on: 'auto', auto: 'off' }[flashMode];
+  showFlashMode();
+  applyCameraConstraint({ torch: flashMode === 'on' });
 });
+
+function isDark() {
+  const sample = document.createElement('canvas');
+  sample.width = 32;
+  sample.height = 24;
+  const context = sample.getContext('2d');
+  context.drawImage($('camVideo'), 0, 0, 32, 24);
+  const pixels = context.getImageData(0, 0, 32, 24).data;
+  let sum = 0;
+  for (let i = 0; i < pixels.length; i += 4) sum += 0.299 * pixels[i] + 0.587 * pixels[i + 1] + 0.114 * pixels[i + 2];
+  return sum / (pixels.length / 4) < DARK_LUMA;
+}
 
 function touchDistance(touches) {
   return Math.hypot(touches[0].clientX - touches[1].clientX, touches[0].clientY - touches[1].clientY);
@@ -514,14 +537,26 @@ function closeCamera() {
   refreshSelection();
 }
 
-function shoot() {
+async function shoot() {
   const video = $('camVideo');
-  if (!video.videoWidth) return;
+  if (shooting || !video.videoWidth) return;
+  shooting = true;
+  const autoLit = flashMode === 'auto' && torchSupported && isDark();
+  if (autoLit) {
+    applyCameraConstraint({ torch: true });
+    await new Promise((resolve) => setTimeout(resolve, 450));   // ışık ve pozlama otursun
+    if (!camStream) {
+      shooting = false;
+      return;
+    }
+  }
   const ratio = Math.min(1, CAMERA_MAX_SIDE / Math.max(video.videoWidth, video.videoHeight));
   const canvas = document.createElement('canvas');
   canvas.width = Math.round(video.videoWidth * ratio);
   canvas.height = Math.round(video.videoHeight * ratio);
   canvas.getContext('2d').drawImage(video, 0, 0, canvas.width, canvas.height);
+  if (autoLit) applyCameraConstraint({ torch: false });
+  shooting = false;
   navigator.vibrate?.(20);
   video.style.opacity = '.3';
   setTimeout(() => { video.style.opacity = ''; }, 80);

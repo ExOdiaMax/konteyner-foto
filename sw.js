@@ -1,5 +1,5 @@
 // Uygulamanın kabuğunu çevrimdışı açılabilir yapar; yüklemeler her zaman ağa gider.
-const CACHE = 'konteyner-foto-v15';
+const CACHE = 'konteyner-foto-v17';
 const SHELL = ['./', 'index.html', 'manifest.webmanifest', 'icon.svg', 'ocr.js'];
 
 self.addEventListener('install', (event) => {

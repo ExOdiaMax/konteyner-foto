@@ -370,7 +370,7 @@ async function runContainerDetection(items, runId) {
           let crop;
           try {
             crop = createOcrCrop(base, region);
-            await worker.setParameters({ tessedit_pageseg_mode: '7' });
+            await worker.setParameters({ tessedit_pageseg_mode: '11' });
             if (runId !== ocrRunId || $('container').value.trim()) return;
             const { data } = await worker.recognize(crop);
             imageReadable = true;

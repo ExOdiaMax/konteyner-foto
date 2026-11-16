@@ -170,6 +170,7 @@
   <button id="camDone">Bitti</button>
 </div>
 
+<script src="ocr.js"></script>
 <script>
 // ---- Ayarlar ----
 const APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbwQgMh6jhLZgEqGC2DbDXFZ5vrACW_9NAWG6fGQ3VJcXF7SNzLg2JAfJfPsyufD-sGtfQ/exec';
@@ -182,6 +183,7 @@ const CAMERA_MAX_SIDE = 1600; // uygulama içi kamerada uzun kenar (galeri foto�
 const DARK_LUMA = 70;         // otomatik flaş: ortalama parlaklık (0-255) bunun altındaysa ışık yanar
 const CONTAINER_PATTERN = /^[A-Z0-9][A-Z0-9_-]{0,31}$/;
 const IMAGE_NAME_PATTERN = /\.(jpe?g|png|webp|heic|heif)$/i;
+const OCR_SCRIPT_URL = 'https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js';
 
 const $ = (id) => document.getElementById(id);
 let pin = null;
@@ -190,6 +192,10 @@ let queue = [];    // seçilmiş, henüz gönderilmemiş
 let failed = [];   // gönderilemeyenler
 let busy = false;
 let wakeLock = null;
+let ocrWorkerPromise = null;
+let ocrDetectionQueue = Promise.resolve();
+let ocrRunId = 0;
+let ocrSuggestion = null;
 
 // ---- Kalıcı kuyruk: küçültülen fotoğraflar yüklenene kadar telefonda saklanır ----
 const DB_NAME = 'konteyner-foto';
@@ -238,6 +244,91 @@ async function callScript(payload) {
     body: JSON.stringify(payload)
   });
   return response.json();
+}
+
+function loadOcrLibrary() {
+  if (window.Tesseract) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const script = document.createElement('script');
+    script.src = OCR_SCRIPT_URL;
+    script.onload = resolve;
+    script.onerror = () => reject(new Error('OCR bileşeni yüklenemedi'));
+    document.head.appendChild(script);
+  });
+}
+
+async function getOcrWorker() {
+  if (!ocrWorkerPromise) {
+    ocrWorkerPromise = (async () => {
+      await loadOcrLibrary();
+      const worker = await Tesseract.createWorker('eng');
+      await worker.setParameters({
+        tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789',
+        tessedit_pageseg_mode: '11'
+      });
+      return worker;
+    })().catch((error) => {
+      ocrWorkerPromise = null;
+      throw error;
+    });
+  }
+  return ocrWorkerPromise;
+}
+
+function detectContainerFromQueue(items) {
+  const runId = ++ocrRunId;
+  ocrDetectionQueue = ocrDetectionQueue.then(() => runContainerDetection(items, runId));
+  return ocrDetectionQueue;
+}
+
+async function runContainerDetection(items, runId) {
+  if (runId !== ocrRunId) return;
+  if ($('container').value.trim()) return;
+
+  const candidates = items.filter((item) => !item.container && (item.file || item.blob));
+  if (candidates.length === 0) return;
+
+  try {
+    const worker = await getOcrWorker();
+    let unreadable = 0;
+    for (let index = 0; index < candidates.length; index += 1) {
+      if (runId !== ocrRunId || $('container').value.trim()) return;
+      const item = candidates[index];
+      if (item.removed) continue;
+
+      $('status').className = '';
+      $('status').textContent = `Konteyner numarası aranıyor (${index + 1}/${candidates.length})... İsterseniz numarayı elle yazabilirsiniz.`;
+      let data;
+      try {
+        ({ data } = await worker.recognize(item.file || item.blob));
+      } catch {
+        unreadable += 1;
+        continue;
+      }
+      if (runId !== ocrRunId) return;
+      const matches = extractContainerIds(data.text);
+      if (matches.length !== 1) continue;
+
+      $('container').value = matches[0];
+      updateViewBtn();
+      ocrSuggestion = matches[0];
+      $('status').className = 'ok';
+      $('status').textContent = `🔎 Fotoğraftan ${matches[0]} bulundu. Yüklemeden önce numarayı kontrol edin.`;
+      return;
+    }
+
+    if (runId === ocrRunId && !$('container').value.trim()) {
+      $('status').className = 'err';
+      $('status').textContent = unreadable
+        ? `${unreadable} fotoğraf OCR ile okunamadı ve konteyner numarası bulunamadı. Lütfen numarayı elle yazın.`
+        : 'Konteyner numarası fotoğraflardan okunamadı. Lütfen numarayı elle yazın.';
+    }
+  } catch (error) {
+    if (runId === ocrRunId) {
+      $('status').className = 'err';
+      $('status').textContent = `${error.message}. Numara okunamadı; lütfen elle yazın.`;
+    }
+  }
 }
 
 async function enter(candidate) {
@@ -380,6 +471,7 @@ function addFiles(fileList) {
     $('status').textContent = notes.join(' ');
   }
   refreshSelection();
+  detectContainerFromQueue(queue.slice());
 }
 
 for (const id of ['gallery', 'camera']) {
@@ -401,11 +493,17 @@ $('folder').addEventListener('change', (event) => {
 });
 
 $('clearBtn').addEventListener('click', () => {
+  ocrRunId += 1;
   for (const item of queue) {
     item.removed = true;
     unpersist(item);
   }
   queue = [];
+  if (ocrSuggestion && typedContainer() === ocrSuggestion) {
+    $('container').value = '';
+    ocrSuggestion = null;
+    updateViewBtn();
+  }
   $('status').textContent = '';
   refreshSelection();
 });
@@ -577,7 +675,10 @@ async function shoot() {
 
 $('cameraBtn').addEventListener('click', openCamera);
 $('shutter').addEventListener('click', shoot);
-$('camDone').addEventListener('click', closeCamera);
+$('camDone').addEventListener('click', () => {
+  closeCamera();
+  detectContainerFromQueue(queue.slice());
+});
 document.addEventListener('visibilitychange', () => { if (document.hidden && camStream) closeCamera(); });
 
 // ---- Yüklenen klasörlerim: daha önce yüklenen konteynerler, birine dokununca numarası kutuya yazılır ----
@@ -683,7 +784,11 @@ function typedContainer() { return $('container').value.trim().toUpperCase().rep
 function updateViewBtn() {
   $('viewBtn').classList.toggle('hidden', !CONTAINER_PATTERN.test(typedContainer()));
 }
-$('container').addEventListener('input', updateViewBtn);
+$('container').addEventListener('input', () => {
+  ocrRunId += 1;
+  if (ocrSuggestion && typedContainer() !== ocrSuggestion) ocrSuggestion = null;
+  updateViewBtn();
+});
 
 async function openView() {
   const container = typedContainer();
@@ -847,6 +952,16 @@ $('sendBtn').addEventListener('click', () => {
     $('status').textContent = 'Önce konteyner numarasını yazın (ör. MSDU6983219).';
     return;
   }
+  if (
+    needsTyped &&
+    ocrSuggestion &&
+    typed === ocrSuggestion &&
+    !confirm(`Fotoğraflardan ${ocrSuggestion} bulundu. Numarayı kontrol ettiniz mi? Bu numara, klasör adı olmayan fotoğraflar için kullanılacak.`)
+  ) {
+    return;
+  }
+  ocrRunId += 1;
+  ocrSuggestion = null;
   const items = queue;
   for (const item of items) {
     item.container = item.container || typed;
@@ -967,6 +1082,7 @@ $('adminLogoutBtn').addEventListener('click', () => {
   if (queue.length > 0) {
     $('status').className = 'err';
     $('status').textContent = `⏳ Önceki yüklemeden ${queue.length} fotoğraf bekliyor. Devam etmek için Gönder'e basın.`;
+    detectContainerFromQueue(queue.slice());
   }
   refreshSelection();
   const saved = load('pin');

@@ -367,11 +367,15 @@ async function runContainerDetection(items, runId) {
 
       const votes = new Map();
       let imageReadable = false;
+      const verified = new Set();
       const addVotes = (text) => {
-        for (const containerId of extractContainerIds(text)) {
-          votes.set(containerId, (votes.get(containerId) || 0) + 1);
+        for (const { id, score } of extractContainerCandidates(text)) {
+          votes.set(id, (votes.get(id) || 0) + score);
+          if (score >= 8) verified.add(id);
         }
       };
+      // Kontrol rakamıyla doğrulanmış bir numara bulunduysa kalan kırpmaları okumaya gerek yok
+      const confident = () => [...verified].some((id) => votes.get(id) >= 16);
 
       try {
         await worker.setParameters({ tessedit_pageseg_mode: '11' });
@@ -385,6 +389,7 @@ async function runContainerDetection(items, runId) {
 
         for (const region of OCR_REGIONS) {
           if (runId !== ocrRunId || $('container').value.trim()) return;
+          if (confident()) break;
           let crop;
           try {
             crop = createOcrCrop(base, region);
@@ -419,7 +424,9 @@ async function runContainerDetection(items, runId) {
       updateViewBtn();
       ocrSuggestion = ranked[0][0];
       $('status').className = 'ok';
-      $('status').textContent = `🔎 Fotoğraftan ${ranked[0][0]} bulundu; ISO kontrol rakamı hesaplandı. Yüklemeden önce numarayı kontrol edin.`;
+      $('status').textContent = verified.has(ranked[0][0])
+        ? `🔎 Fotoğraftan ${ranked[0][0]} bulundu; kontrol rakamı fotoğraftakiyle eşleşti.`
+        : `🔎 Fotoğraftan ${ranked[0][0]} bulundu ama kontrol rakamı fotoğrafta okunamadı. Yüklemeden önce numarayı kontrol edin.`;
       return;
     }
 

@@ -401,7 +401,7 @@ async function runContainerDetection(items, runId) {
       updateViewBtn();
       ocrSuggestion = ranked[0][0];
       $('status').className = 'ok';
-      $('status').textContent = `🔎 Fotoğraftan ${ranked[0][0]} bulundu. Yüklemeden önce numarayı kontrol edin.`;
+      $('status').textContent = `🔎 Fotoğraftan ${ranked[0][0]} bulundu; ISO kontrol rakamı hesaplandı. Yüklemeden önce numarayı kontrol edin.`;
       return;
     }
 
